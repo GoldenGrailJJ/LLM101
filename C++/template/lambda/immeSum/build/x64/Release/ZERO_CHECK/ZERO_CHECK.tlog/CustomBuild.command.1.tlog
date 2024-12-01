@@ -1,0 +1,10 @@
+^D:\PROGRAMLLM\WORKSPACE\LLM101\C++\TEMPLATE\LAMBDA\IMMESUM\BUILD\CMAKEFILES\D10D13F36D9072705EFD26048F1169F3\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/ProgramLLM/workspace/LLM101/C++/template/lambda/immeSum -BD:/ProgramLLM/workspace/LLM101/C++/template/lambda/immeSum/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/ProgramLLM/workspace/LLM101/C++/template/lambda/immeSum/build/hellocpp.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd
