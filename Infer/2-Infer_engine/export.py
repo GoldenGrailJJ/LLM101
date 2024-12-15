@@ -1,3 +1,124 @@
+"""
+This script has functions and utilties for model export.
+Basically, we have a bunch of versions of the model, and we
+want to export them to .bin files to be read from and inferenced in C.
+
+Among the "input" versions of PyTorch files/models:
+- Official Llama 2 weights released by Meta
+- Huggingface weights available on the hub
+- llama2.c (this repo) trained models
+
+Among the "output" versions of .bin files:
+- v0: Legacy files of the original llama2.c repo (will eventually be DEPRECATED)
+- v1-vN: Improved .bin files with a proper header, cache alignment, etc.
+
+This script aspires to provide all of these conversions.
+"""
+import os
+import gzip
+import shutil
+import struct
+import argparse
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import nn
+
+from model import ModelArgs, Transformer
+
+
+# -----------------------------------------------------------------------------
+# common utilities
+
+
+# -----------------------------------------------------------------------------
+# Output
+def legacy_export(model, filepath):
+    """
+    Export the model weights to a legacy binary format (version v0) used by llama2.c.
+
+    Args:
+        model: The model instance containing the weights to be exported.
+        filepath (str): The path where the binary file will be saved.
+    """
+    
+    # Open the output file in binary write mode.
+    out_file = open(filepath, 'wb')
+
+    # First, write out the header information for the binary file.
+    hidden_dim = model.layers[0].feed_forward.w1.weight.shape[0]  # Get the hidden dimension from the first layer's feed-forward weights.
+    p = model.params  # Access the model parameters.
+    
+    # Check if the token embeddings and output weights are shared.
+    shared_classifier = torch.equal(model.tok_embeddings.weight, model.output.weight)
+    
+    # In the legacy format, use negative vocabulary size as a flag for shared classifier.
+    if not shared_classifier:
+        p.vocab_size = -p.vocab_size  # Negate the vocabulary size if not shared.
+
+    # Determine the number of key-value heads, defaulting to the number of heads if not specified.
+    n_kv_heads = p.n_heads if p.n_kv_heads is None else p.n_kv_heads
+    
+    # Pack the header information into a binary format.
+    # i*7 means packing 7 int to binary string
+    header = struct.pack('iiiiiii', p.dim, hidden_dim, p.n_layers, p.n_heads,
+                         n_kv_heads, p.vocab_size, p.max_seq_len)
+    
+    # Write the header to the output file.
+    out_file.write(header)
+
+    # Next, write out the embedding weights of the model.
+    serialize_fp32(out_file, model.tok_embeddings.weight)
+
+    # Now, write out the weights for all layers in the model.
+    
+    # Write attention weights for each layer.
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.attention_norm.weight)  # Write attention normalization weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.attention.wq.weight)  # Write query weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.attention.wk.weight)  # Write key weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.attention.wv.weight)  # Write value weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.attention.wo.weight)  # Write output weights.
+
+    # Write feed-forward network weights for each layer.
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.ffn_norm.weight)  # Write feed-forward normalization weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.feed_forward.w1.weight)  # Write first feed-forward layer weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.feed_forward.w2.weight)  # Write second feed-forward layer weights.
+    
+    for layer in model.layers:
+        serialize_fp32(out_file, layer.feed_forward.w3.weight)  # Write third feed-forward layer weights.
+
+    # Write the final normalization weights.
+    serialize_fp32(out_file, model.norm.weight)
+
+    # Write the frequency components for cosine and sine.
+    serialize_fp32(out_file, model.freqs_cos[:p.max_seq_len])  # Write cosine frequencies.
+    serialize_fp32(out_file, model.freqs_sin[:p.max_seq_len])  # Write sine frequencies.
+
+    # Write the final classifier weights if the classifier is not shared.
+    if not shared_classifier:
+        serialize_fp32(out_file, model.output.weight)
+
+    # Close the output file after writing all weights.
+    out_file.close()
+    
+    # Print a message indicating that the file has been written successfully.
+    print(f"wrote {filepath}")
 
 
 
@@ -47,7 +168,6 @@ def load_checkpoint(checkpoint):
     
     # Return the loaded model instance.
     return model
-
 
 def load_meta_model(model_path):
     """
@@ -163,7 +283,6 @@ def load_meta_model(model_path):
     # Return the fully constructed and loaded model instance.
     return model
 
-
 def load_hf_model(model_path):
     """
     Load a Hugging Face model from the specified path and convert it to a custom Transformer model.
@@ -237,7 +356,7 @@ def load_hf_model(model_path):
     model.eval()
     
     total_params = sum(p.numel() for p in model.parameters())
-    
+
     # Return the fully constructed and loaded Transformer model instance.
     return model
 
