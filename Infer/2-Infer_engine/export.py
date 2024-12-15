@@ -30,11 +30,101 @@ from model import ModelArgs, Transformer
 
 
 # -----------------------------------------------------------------------------
-# common utilities
+# Common utilities
+
+def serialize_fp32(file, tensor):
+    """ 
+    Writes a single float32 tensor to a binary file that is open in write-binary mode ('wb').
+
+    Args:
+        file: The file object where the tensor will be written.
+        tensor: The PyTorch tensor to be serialized, expected to be in float32 format.
+    """
+    # Detach the tensor from the current computation graph, move it to CPU, flatten it to 1D,
+    # convert it to float32, and then convert it to a NumPy array.
+    d = tensor.detach().cpu().view(-1).to(torch.float32).numpy()
+    
+    # Pack the NumPy array into a binary format using struct, where 'f' indicates float32.
+    b = struct.pack(f'{len(d)}f', *d)
+    
+    # Write the packed binary data to the specified file.
+    file.write(b)
+
+def serialize_int8(file, tensor):
+    """ 
+    Writes a single int8 tensor to a binary file that is open in write-binary mode ('wb').
+
+    Args:
+        file: The file object where the tensor will be written.
+        tensor: The PyTorch tensor to be serialized, expected to be in int8 format.
+    """
+    # Detach the tensor from the current computation graph, move it to CPU, flatten it to 1D,
+    # convert it to int8 format using NumPy.
+    d = tensor.detach().cpu().view(-1).numpy().astype(np.int8)
+    
+    # Pack the NumPy array into a binary format using struct, where 'b' indicates int8.
+    b = struct.pack(f'{len(d)}b', *d)
+    
+    # Write the packed binary data to the specified file.
+    file.write(b)
+
+def quantize_q80(w, group_size):
+    """
+    Takes a tensor and returns its Q8_0 quantized version, which is a symmetric quantization
+    into int8 format, with values in the range [-127, 127].
+
+    Args:
+        w: The input tensor to be quantized.
+        group_size: The size of the groups for quantization.
+
+    Returns:
+        int8val: The quantized tensor in int8 format.
+        scale: The scaling factors used for quantization.
+        maxerr: The maximum quantization error across all groups.
+    """
+    # Ensure that the number of elements in the tensor is a multiple of the group size.
+    assert w.numel() % group_size == 0
+    
+    # Store the original shape of the tensor for later use.
+    ori_shape = w.shape
+    
+    # Convert the tensor to float32 for quantization calculations.
+    w = w.float() 
+    
+    # Reshape the tensor into groups of the specified size.
+    w = w.reshape(-1, group_size)
+    
+    # Find the maximum absolute value in each group.
+    wmax = torch.abs(w).max(dim=1).values
+    
+    # Calculate the scaling factor such that the float value equals quantized value times scale.
+    scale = wmax / 127.0
+    
+    # Scale the tensor into the range [-127, 127].
+    quant = w / scale[:, None]
+    
+    # Round the scaled values to the nearest integer and convert to int8.
+    int8val = torch.round(quant).to(torch.int8)
+    
+    # Dequantize by rescaling the int8 values back to float32.
+    fp32val = (int8val.float() * scale[:, None]).view(-1)
+    
+    # Reshape the dequantized values back to the original group shape.
+    fp32valr = fp32val.reshape(-1, group_size)
+    
+    # Calculate the maximum error in each group by comparing the dequantized values to the original tensor.
+    err = torch.abs(fp32valr - w).max(dim=1).values
+    
+    # Find the maximum error across all groups.
+    maxerr = err.max().item()
+    
+    # Return the quantized tensor, scaling factors, and maximum error.
+    return int8val, scale, maxerr
 
 
 # -----------------------------------------------------------------------------
 # Output
+
 def legacy_export(model, filepath):
     """
     Export the model weights to a legacy binary format (version v0) used by llama2.c.
@@ -119,8 +209,6 @@ def legacy_export(model, filepath):
     
     # Print a message indicating that the file has been written successfully.
     print(f"wrote {filepath}")
-
-
 
 # -----------------------------------------------------------------------------
 # Load / import functions
