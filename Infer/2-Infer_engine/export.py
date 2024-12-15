@@ -236,6 +236,8 @@ def load_hf_model(model_path):
     # Set the model to evaluation mode, which disables dropout and batch normalization.
     model.eval()
     
+    total_params = sum(p.numel() for p in model.parameters())
+    
     # Return the fully constructed and loaded Transformer model instance.
     return model
 
