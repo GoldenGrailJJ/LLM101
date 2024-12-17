@@ -121,7 +121,6 @@ def quantize_q80(w, group_size):
     # Return the quantized tensor, scaling factors, and maximum error.
     return int8val, scale, maxerr
 
-
 # -----------------------------------------------------------------------------
 # Output
 

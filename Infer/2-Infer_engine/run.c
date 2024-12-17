@@ -207,11 +207,153 @@ void malloc_run_state(RunState* s, Config* p) {
         exit(EXIT_FAILURE); // Exit if any allocation fails
     }
 }
+
+void free_run_state(RunState* s) {
+    free(s->x);
+    free(s->xb);
+    free(s->xb2);
+    free(s->hb);
+    free(s->hb2);
+    free(s->q);
+    free(s->att);
+    free(s->logits);
+    free(s->key_cache);
+    free(s->value_cache);
+}
+
+/**
+ * @brief Maps the weights of the Transformer model from a memory pointer.
+ *
+ * This function assigns the appropriate memory locations for various weight matrices
+ * in the Transformer model based on the provided configuration. It uses a pointer to
+ * traverse the memory layout and assigns the weights to the corresponding fields in
+ * the TransformerWeights structure.
+ *
+ * @param w A pointer to the TransformerWeights structure where the weights will be mapped.
+ * @param p A pointer to the Config structure that contains configuration parameters
+ *          used to determine the sizes of the weights.
+ * @param ptr A pointer to the memory location where the weights are stored.
+ * @param shared_weights An integer flag indicating whether the weights are shared (1) or not (0).
+ */
+/*
+|-------------------------------|
+| Token Embedding Table         |  (p->vocab_size * p->dim)
+|-------------------------------|
+| RMS Attention Weights         |  (n_layers * p->dim)
+|-------------------------------|
+| Query Weights (wq)            |  (n_layers * p->dim * (p->n_heads * head_size))
+|-------------------------------|
+| Key Weights (wk)              |  (n_layers * p->dim * (p->n_kv_heads * head_size))
+|-------------------------------|
+| Value Weights (wv)            |  (n_layers * p->dim * (p->n_kv_heads * head_size))
+|-------------------------------|
+| Output Weights (wo)           |  (n_layers * (p->n_heads * head_size) * p->dim)
+|-------------------------------|
+| RMS Feedforward Weights       |  (n_layers * p->dim)
+|-------------------------------|
+| First Feedforward Weights (w1)|  (n_layers * p->dim * p->hidden_dim)
+|-------------------------------|
+| Second Feedforward Weights(w2)| (n_layers * p->hidden_dim * p->dim)
+|-------------------------------|
+| Third Feedforward Weights (w3)|  (n_layers * p->dim * p->hidden_dim)
+|-------------------------------|
+| RMS Final Weights             |  (p->dim)
+|-------------------------------|
+| Skipped freq_cis_real         |  (p->seq_len * head_size / 2)
+|-------------------------------|
+| Skipped freq_cis_imag         |  (p->seq_len * head_size / 2)
+|-------------------------------|
+| CLS Weights (wcls)            |  (shared_weights ? w->token_embedding_table : ptr)
+|-------------------------------|
+*/
+void memory_map_weights(TransformerWeights *w, Config* p, float* ptr, int shared_weights) {
+    // Calculate the size of each head based on the model dimension
+    int head_size = p->dim / p->n_heads;
+
+    // Use 64-bit integers to handle large parameter counts for models with 13B+ parameters
+    unsigned long long n_layers = p->n_layers;
+
+    // Map the token embedding table to the appropriate memory location
+    w->token_embedding_table = ptr;
+    ptr += p->vocab_size * p->dim; // Move the pointer past the token embedding table
+
+    // Map the RMS attention weights
+    w->rms_att_weight = ptr;
+    ptr += n_layers * p->dim; // Move the pointer past the RMS attention weights
+
+    // Map the query weights
+    w->wq = ptr;
+    ptr += n_layers * p->dim * (p->n_heads * head_size); // Move the pointer past the query weights
+
+    // Map the key weights
+    w->wk = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size); // Move the pointer past the key weights
+
+    // Map the value weights
+    w->wv = ptr;
+    ptr += n_layers * p->dim * (p->n_kv_heads * head_size); // Move the pointer past the value weights
+
+    // Map the output weights
+    w->wo = ptr;
+    ptr += n_layers * (p->n_heads * head_size) * p->dim; // Move the pointer past the output weights
+
+    // Map the RMS feedforward network weights
+    w->rms_ffn_weight = ptr;
+    ptr += n_layers * p->dim; // Move the pointer past the RMS feedforward weights
+
+    // Map the first feedforward layer weights
+    w->w1 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim; // Move the pointer past the first feedforward layer weights
+
+    // Map the second feedforward layer weights
+    w->w2 = ptr;
+    ptr += n_layers * p->hidden_dim * p->dim; // Move the pointer past the second feedforward layer weights
+
+    // Map the third feedforward layer weights
+    w->w3 = ptr;
+    ptr += n_layers * p->dim * p->hidden_dim; // Move the pointer past the third feedforward layer weights
+
+    // Map the RMS final weights
+    w->rms_final_weight = ptr;
+    ptr += p->dim; // Move the pointer past the RMS final weights
+
+    // Skip the memory for frequency components used in RoPE (Rotary Positional Encoding)
+    ptr += p->seq_len * head_size / 2; // Skip what used to be freq_cis_real
+    ptr += p->seq_len * head_size / 2; // Skip what used to be freq_cis_imag
+
+    // If weights are shared, point wcls to the token embedding table; otherwise, map to the next pointer
+    w->wcls = shared_weights ? w->token_embedding_table : ptr;
+}
+
 void build_transformer(Transformer *t, char* checkpoint_path) {
     // read in the Config and the Weights from the checkpoint
     read_checkpoint(checkpoint_path, &t->config, &t->weights, &t->fd, &t->data, &t->file_size);
     // allocate the RunState buffers
     malloc_run_state(&t->state, &t->config);
+}
+
+/**
+ * @brief Frees the resources allocated for the Transformer structure.
+ *
+ * This function is responsible for cleaning up and releasing any memory or resources
+ * that were allocated for the Transformer model. It ensures that all dynamically
+ * allocated memory is properly freed to prevent memory leaks.
+ *
+ * @param t A pointer to the Transformer structure that needs to be freed.
+ */
+void free_transformer(Transformer* t) {
+    // Close the memory mapping if it was successfully created
+    if (t->data != MAP_FAILED) { 
+        munmap(t->data, t->file_size); // Unmap the memory region associated with the Transformer data
+    }
+    
+    // Close the file descriptor if it is valid
+    if (t->fd != -1) { 
+        close(t->fd); // Close the file descriptor to release the associated resources
+    }
+    
+    // Free the RunState buffers associated with the Transformer
+    free_run_state(&t->state); // Call a function to free the memory allocated for the RunState structure
 }
 
 int main(int argc, char *argv[]){
