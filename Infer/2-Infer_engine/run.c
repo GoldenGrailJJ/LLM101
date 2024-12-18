@@ -356,6 +356,131 @@ void free_transformer(Transformer* t) {
     free_run_state(&t->state); // Call a function to free the memory allocated for the RunState structure
 }
 
+// ----------------------------------------------------------------------------
+// The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+
+// TokenIndex struct stores a token's string and its corresponding ID.
+typedef struct {
+    char *str;  // The string representation of the token.
+    int id;     // The unique identifier (ID) for the token.
+} TokenIndex;
+
+// Tokenizer struct holds the vocabulary and related data for tokenization.
+// It also includes a sorted vocabulary for efficient lookups.
+typedef struct {
+    char** vocab;             // Array of strings representing the vocabulary.
+    float* vocab_scores;      // Array of scores (probabilities, weights, etc.) for each vocabulary item.
+    TokenIndex *sorted_vocab; // Sorted array of TokenIndex, used for efficient token lookups.
+    int vocab_size;           // The total number of tokens in the vocabulary.
+    unsigned int max_token_length; // The maximum length of a token (e.g., maximum byte length of token strings).
+    unsigned char byte_pieces[512]; // Array to store all single-byte strings, typically for subword units or token pieces.
+} Tokenizer;
+
+/**
+ * @brief Builds a tokenizer by reading vocabulary and related data from a file.
+ *
+ * This function initializes a Tokenizer structure by reading the vocabulary size,
+ * vocabulary strings, and their associated scores from a binary file. It allocates
+ * memory for these components and initializes certain arrays. It also processes
+ * single-byte strings for byte-pair encoding.
+ *
+ * @param t A pointer to the Tokenizer structure that will be populated.
+ * @param tokenizer_path The path to the binary file containing the tokenizer data.
+ * @param vocab_size The size of the vocabulary, indicating how many entries to read.
+ *
+ * @return void
+ */
+void build_tokenizer(Tokenizer* t, char* tokenizer_path, int vocab_size) {
+    // Set the vocabulary size to the given parameter value
+    t->vocab_size = vocab_size; 
+
+    // Allocate memory to store vocabulary strings and their corresponding scores
+    t->vocab = (char**)malloc(vocab_size * sizeof(char*));  // Allocate memory for vocabulary strings
+    t->vocab_scores = (float*)malloc(vocab_size * sizeof(float));  // Allocate memory for vocabulary scores
+
+    // Initialize sorted_vocab lazily (not used for now)
+    t->sorted_vocab = NULL;
+
+    // Initialize byte_pieces array to represent all single-byte characters
+    for (int i = 0; i < 256; i++) {
+        t->byte_pieces[i * 2] = (unsigned char)i;   // Store the byte character at even indices
+        t->byte_pieces[i * 2 + 1] = '\0';           // Null-terminate the byte string at odd indices
+    }
+
+    // Open the tokenizer file in binary read mode
+    FILE *file = fopen(tokenizer_path, "rb");
+    if (!file) {
+        // Handle file open failure and exit if the file cannot be loaded
+        fprintf(stderr, "couldn't load %s\n", tokenizer_path); 
+        exit(EXIT_FAILURE); // Exit on failure to open the file
+    }
+
+    // Read the maximum token length from the file
+    if (fread(&t->max_token_length, sizeof(int), 1, file) != 1) {
+        // Handle failed read operation and exit
+        fprintf(stderr, "failed read\n"); 
+        exit(EXIT_FAILURE);
+    }
+
+    int len;
+    // Read the vocabulary entries (scores and strings) from the file
+    for (int i = 0; i < vocab_size; i++) {
+        // 1.Read the score for the current vocabulary item
+        if (fread(t->vocab_scores + i, sizeof(float), 1, file) != 1) {
+            // Handle failed read operation and exit
+            fprintf(stderr, "failed read\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // 2.Read the length of the current vocabulary string
+        if (fread(&len, sizeof(int), 1, file) != 1) {
+            // Handle failed read operation and exit
+            fprintf(stderr, "failed read\n");
+            exit(EXIT_FAILURE);
+        }
+
+        // 3.Allocate memory for the current vocabulary string (including null terminator)
+        t->vocab[i] = (char *)malloc(len + 1);
+        if (fread(t->vocab[i], len, 1, file) != 1) {
+            // Handle failed read operation and exit
+            fprintf(stderr, "failed read\n");
+            exit(EXIT_FAILURE);
+        }
+        
+        // Null-terminate the string to ensure proper string handling
+        t->vocab[i][len] = '\0';
+    }
+
+    // Close the file after reading all the necessary data
+    fclose(file);
+}
+
+/**
+ * @brief Frees the resources allocated for the Tokenizer structure.
+ *
+ * This function is responsible for cleaning up and releasing any dynamically allocated memory
+ * for the Tokenizer, including the vocabulary strings, scores, and sorted vocabulary. 
+ * It ensures that all dynamically allocated memory is properly freed to prevent memory leaks.
+ *
+ * @param t A pointer to the Tokenizer structure that needs to be freed.
+ */
+void free_tokenizer(Tokenizer* t) {
+    // Loop through all vocabulary entries and free the memory allocated for each vocabulary string
+    for (int i = 0; i < t->vocab_size; i++) { 
+        free(t->vocab[i]);  // Free memory for each string in the vocabulary
+    }
+    
+    // Free the memory allocated for the vocabulary array itself
+    free(t->vocab);
+    
+    // Free the memory allocated for vocabulary scores
+    free(t->vocab_scores);
+    
+    // Free the memory allocated for the sorted vocabulary structure
+    free(t->sorted_vocab);
+}
+
+
 int main(int argc, char *argv[]){
 
     // Default parameters for the model and sampling
