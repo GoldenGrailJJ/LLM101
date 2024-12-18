@@ -376,6 +376,10 @@ typedef struct {
     unsigned char byte_pieces[512]; // Array to store all single-byte strings, typically for subword units or token pieces.
 } Tokenizer;
 
+int compare_tokens(const void *a, const void *b) {
+    return strcmp(((TokenIndex*)a)->str, ((TokenIndex*)b)->str);
+}
+
 /**
  * @brief Builds a tokenizer by reading vocabulary and related data from a file.
  *
@@ -478,6 +482,216 @@ void free_tokenizer(Tokenizer* t) {
     
     // Free the memory allocated for the sorted vocabulary structure
     free(t->sorted_vocab);
+}
+
+/*
+ * Function: encode
+ * ----------------
+ * This function encodes an input text string into a sequence of tokens, using a vocabulary for encoding.
+ * It optionally adds a Beginning-of-Sequence (BOS) token and an End-of-Sequence (EOS) token.
+ * It also merges consecutive tokens into a new token if that merge has a higher score in the vocabulary.
+ * 
+ * Example:
+ * 
+ *    Tokenizer t;
+ *    int tokens[100];
+ *    int n_tokens = 0;
+ *    encode(&t, "hello world", 1, 1, tokens, &n_tokens);
+ * 
+ * In the above example, the input text "hello world" will be tokenized, and the tokens will be stored
+ * in the `tokens` array. The BOS and EOS tokens will be added because both `bos` and `eos` are set to 1.
+ */
+void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *n_tokens) {
+    // Check for null input text and exit with an error message if true
+    if (text == NULL) { 
+        fprintf(stderr, "cannot encode NULL text\n"); 
+        exit(EXIT_FAILURE); 
+    }
+
+    // Lazy initialization of sorted vocabulary if it hasn't been done already
+    if (t->sorted_vocab == NULL) {
+        // Allocate memory for sorted vocabulary and copy contents
+        t->sorted_vocab = malloc(t->vocab_size * sizeof(TokenIndex));
+        for (int i = 0; i < t->vocab_size; i++) {
+            t->sorted_vocab[i].str = t->vocab[i];
+            t->sorted_vocab[i].id = i;
+        }
+        // Sort vocabulary based on tokens using a custom comparison function
+        qsort(t->sorted_vocab, t->vocab_size, sizeof(TokenIndex), compare_tokens);
+    }
+
+    // Allocate a temporary buffer to store UTF-8 code points and merged token candidates
+    // *2 for concatenation, +1 for the null terminator, +2 for possible UTF-8 encoding
+    char* str_buffer = malloc((t->max_token_length * 2 + 1 + 2) * sizeof(char));
+    size_t str_len = 0;
+
+    // Initialize token count to zero
+    *n_tokens = 0;
+
+    // Add optional BOS (=1) token if specified
+    if (bos) tokens[(*n_tokens)++] = 1;
+
+    // Optional dummy prefix handling (adds a space token to the input if not empty)
+    if (text[0] != '\0') {
+        int dummy_prefix = str_lookup(" ", t->sorted_vocab, t->vocab_size);
+        tokens[(*n_tokens)++] = dummy_prefix;
+    }
+
+    // Begin processing the input text as a sequence of UTF-8 bytes
+    for (char *c = text; *c != '\0'; c++) {
+        // Reset the buffer if the current byte is ASCII or the start of a new UTF-8 codepoint
+        if ((*c & 0xC0) != 0x80) {
+            // If not a continuation byte, reset the buffer to start a new codepoint
+            str_len = 0;
+        }
+
+        // Append the current byte to the buffer
+        str_buffer[str_len++] = *c;
+        str_buffer[str_len] = '\0'; // Null-terminate the buffer
+
+        // If the next byte is a continuation byte and we're not out of buffer space, keep appending
+        if ((*(c + 1) & 0xC0) == 0x80 && str_len < 4) {
+            continue;
+        }
+
+        // Now we've read a complete UTF-8 codepoint
+        int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+
+        if (id != -1) {
+            // If this codepoint exists in the vocabulary, add it as a token
+            tokens[(*n_tokens)++] = id;
+        } else {
+            // Fallback to encoding each byte individually as a token
+            // The "+3" accounts for the first three vocab elements (<unk>, <s>, </s>)
+            for (int i = 0; i < str_len; i++) {
+                tokens[(*n_tokens)++] = (unsigned char)str_buffer[i] + 3;
+            }
+        }
+        // Reset buffer length for the next codepoint
+        str_len = 0;
+    }
+
+    // Merge the best consecutive pair of tokens based on their scores in the vocab
+    while (1) {
+        float best_score = -1e10; // Initialize best score to a very low value
+        int best_id = -1;         // To store the id of the best merge token
+        int best_idx = -1;        // To store the index of the best token pair
+
+        // Check each consecutive pair of tokens
+        for (int i = 0; i < (*n_tokens - 1); i++) {
+            // Try to merge tokens[i] and tokens[i+1]
+            sprintf(str_buffer, "%s%s", t->vocab[tokens[i]], t->vocab[tokens[i+1]]);
+            int id = str_lookup(str_buffer, t->sorted_vocab, t->vocab_size);
+            
+            // If a valid pair is found and it has a higher score, record it
+            if (id != -1 && t->vocab_scores[id] > best_score) {
+                best_score = t->vocab_scores[id];
+                best_id = id;
+                best_idx = i;
+            }
+        }
+
+        // If no valid pair was found, break the loop (no more merges possible)
+        if (best_idx == -1) {
+            break;
+        }
+
+        // Merge the best pair into a single token at the index best_idx
+        tokens[best_idx] = best_id;
+
+        // Shift the remaining tokens to remove the second token in the merged pair
+        for (int i = best_idx + 1; i < (*n_tokens - 1); i++) {
+            tokens[i] = tokens[i + 1];
+        }
+        (*n_tokens)--; // Decrease the token count
+    }
+
+    // Add optional EOS (=2) token if specified
+    if (eos) tokens[(*n_tokens)++] = 2;
+
+    // Free the allocated memory for the string buffer
+    free(str_buffer);
+}
+
+// ----------------------------------------------------------------------------
+// generation loop
+
+/**
+ * @brief Generates text based on a prompt using the Transformer model and a Sampler.
+ *
+ * This function generates a sequence of tokens based on an initial text prompt. The tokens are 
+ * iteratively predicted by the Transformer model, with the next token being either forced (if still 
+ * processing the prompt) or sampled based on logits. The function continues generating tokens until 
+ * the specified number of steps is reached or a special "beginning of sequence" (BOS) token is generated.
+ *
+ * @param transformer Pointer to the Transformer model used for generating tokens.
+ * @param tokenizer Pointer to the Tokenizer used for encoding/decoding tokens.
+ * @param sampler Pointer to the Sampler used for sampling the next token from logits.
+ * @param prompt The initial prompt string to start the generation.
+ * @param steps The number of tokens to generate.
+ */
+void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
+    // 1.If prompt is NULL, use an empty string as default
+    char *empty_prompt = "";
+    if (prompt == NULL) { prompt = empty_prompt; }
+
+    // 2.Encode the (string) prompt into a sequence of tokens
+    int num_prompt_tokens = 0;
+    //   Allocate memory for the prompt tokens array (+3 for '\0', BOS, and EOS tokens)
+    int* prompt_tokens = (int*)malloc((strlen(prompt) + 3) * sizeof(int)); 
+    encode(tokenizer, prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+    if (num_prompt_tokens < 1) {
+        // Handle case where no prompt tokens are generated
+        fprintf(stderr, "something is wrong, expected at least 1 prompt token\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Start the main loop for generating tokens
+    long start = 0;  // Used to time the execution, initialized after the first iteration
+    int next;        // Will store the next token in the sequence
+    int token = prompt_tokens[0]; // Initialize with the first token from the prompt
+    int pos = 0;     // Position in the token sequence
+
+    // Loop to generate tokens until reaching the specified number of steps
+    while (pos < steps) {
+
+        // Perform a forward pass through the transformer model to get logits for the next token
+        float* logits = forward(transformer, token, pos);
+
+        // Advance the state machine
+        if (pos < num_prompt_tokens - 1) {
+            // If still processing the input prompt, force the next prompt token
+            next = prompt_tokens[pos + 1];
+        } else {
+            // Otherwise, sample the next token from the logits
+            next = sample(sampler, logits);
+        }
+        pos++;
+
+        // Check for termination condition: BOS token (value 1) signifies end of sequence
+        if (next == 1) { break; }
+
+        // Decode the generated token back to string and print it
+        char* piece = decode(tokenizer, token, next);
+        safe_printf(piece);  // Print the token, skipping "unsafe" bytes
+        fflush(stdout);      // Ensure the output is printed immediately
+        token = next;        // Set the current token to the newly sampled token
+
+        // Initialize the timer after the first iteration (which may be slower)
+        if (start == 0) { start = time_in_ms(); }
+    }
+
+    // Print a newline after token generation
+    printf("\n");
+
+    // Report the achieved tokens per second (tok/s) based on the elapsed time
+    if (pos > 1) {
+        long end = time_in_ms();  // Get the end time
+        fprintf(stderr, "achieved tok/s: %f\n", (pos - 1) / (double)(end - start) * 1000);
+    }
+
+    // Free the allocated memory for prompt tokens
+    free(prompt_tokens);
 }
 
 
