@@ -485,6 +485,76 @@ void free_tokenizer(Tokenizer* t) {
 }
 
 /*
+ * Function: safe_printf
+ * ---------------------
+ * This function safely prints the input string `piece` to the console, but with certain restrictions.
+ * Specifically, it ensures that only printable characters or whitespace are printed. 
+ * This is useful in cases where `piece` may contain raw byte tokens, which might include control characters or other non-printable bytes.
+ *
+ * Parameters:
+ *    piece   - The string to be printed.
+ * 
+ * Returns:
+ *    None. It prints the string to the console if it's valid (i.e., contains printable characters).
+ */
+void safe_printf(char *piece) {
+    // If the input piece is NULL, we do nothing and return.
+    if (piece == NULL) { 
+        return; 
+    }
+
+    // If the input piece is an empty string (first character is null terminator), do nothing and return.
+    if (piece[0] == '\0') { 
+        return; 
+    }
+
+    // If the string only contains one character, check if it's a printable character or whitespace.
+    // This is to handle cases where piece may be a single raw byte or token.
+    if (piece[1] == '\0') {
+        // Convert the first byte to unsigned char to prevent sign extension issues.
+        unsigned char byte_val = piece[0];
+        
+        // If the byte is neither a printable character nor whitespace, we don't print it.
+        if (!(isprint(byte_val) || isspace(byte_val))) {
+            return; // The byte is not printable or whitespace, don't print it.
+        }
+    }
+
+    // If the string passes the above checks, it's safe to print.
+    printf("%s", piece);
+}
+
+/*
+ * Function: str_lookup
+ * ---------------------
+ * This function searches for an exact match of the input string `str` in a sorted vocabulary array (`sorted_vocab`).
+ * It uses binary search to find the string efficiently and returns the index of the matching token in the vocabulary.
+ * If the string is not found, it returns -1.
+ * 
+ * Parameters:
+ *    str           - The string to search for in the vocabulary.
+ *    sorted_vocab  - The sorted array of `TokenIndex` structures representing the vocabulary.
+ *    vocab_size    - The total size (number of elements) of the vocabulary.
+ * 
+ * Returns:
+ *    The index (id) of the matching token in the vocabulary, or -1 if not found.
+ */
+int str_lookup(char *str, TokenIndex *sorted_vocab, int vocab_size) {
+    // Create a TokenIndex object with the search string as the key.
+    // This object will be used as the search key for the binary search.
+    TokenIndex tok = { .str = str };
+
+    // Use binary search to find the token in the sorted vocabulary.
+    // The `bsearch` function searches for the `tok` in the sorted vocabulary array.
+    // It uses the `compare_tokens` function to compare elements.
+    TokenIndex *res = bsearch(&tok, sorted_vocab, vocab_size, sizeof(TokenIndex), compare_tokens);
+
+    // If the result is found (not NULL), return its ID (index) from the vocabulary.
+    // If the result is NULL (not found), return -1.
+    return res != NULL ? res->id : -1;
+}
+
+/*
  * Function: encode
  * ----------------
  * This function encodes an input text string into a sequence of tokens, using a vocabulary for encoding.
