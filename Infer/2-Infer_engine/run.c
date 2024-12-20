@@ -357,6 +357,10 @@ void free_transformer(Transformer* t) {
 }
 
 // ----------------------------------------------------------------------------
+// neural net blocks; the dynamics of the Transformer
+
+
+// ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
 // TokenIndex struct stores a token's string and its corresponding ID.
@@ -684,6 +688,14 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 }
 
 // ----------------------------------------------------------------------------
+// The Sampler, which takes logits and returns a sampled token
+// sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
+
+// ----------------------------------------------------------------------------
+// utilities: time
+
+
+// ----------------------------------------------------------------------------
 // generation loop
 
 /**
@@ -716,7 +728,7 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
         exit(EXIT_FAILURE);
     }
 
-    // Start the main loop for generating tokens
+    // 3.Start the main loop for generating tokens
     long start = 0;  // Used to time the execution, initialized after the first iteration
     int next;        // Will store the next token in the sequence
     int token = prompt_tokens[0]; // Initialize with the first token from the prompt
@@ -764,6 +776,43 @@ void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, 
     free(prompt_tokens);
 }
 
+/*
+ * Function: read_stdin
+ * ---------------------
+ * This function reads a line of input from standard input (stdin) and stores it in a buffer. It ensures that the line does not exceed
+ * a specified maximum buffer size and removes the newline character (`\n`) at the end of the input, if present.
+ *
+ * Parameters:
+ *    guide    - A string (prompt) displayed to the user before reading input.
+ *    buffer   - A pointer to the buffer where the input line will be stored.
+ *    bufsize  - The size of the buffer. It ensures that no more than `bufsize - 1` characters are read.
+ *
+ * Returns:
+ *    None. The function modifies the `buffer` to contain the input string (without the newline character).
+ */
+void read_stdin(const char* guide, char* buffer, size_t bufsize) {
+    // Print the guide (prompt) message to the user, asking for input.
+    printf("%s", guide);
+
+    // Use fgets to read a line from stdin into the buffer, ensuring we don't exceed the buffer size.
+    // fgets reads up to bufsize-1 characters, ensuring there's room for the null terminator.
+    if (fgets(buffer, bufsize, stdin) != NULL) {
+        // Get the length of the input string, including the newline character.
+        size_t len = strlen(buffer);
+
+        // Check if the last character is a newline and remove it.
+        // fgets keeps the newline in the buffer if the input is shorter than the buffer size.
+        if (len > 0 && buffer[len - 1] == '\n') {
+            buffer[len - 1] = '\0'; // Replace the newline with null terminator
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// chat loop
+// I manually inspected the tokens for a few chat conversations compared to
+// python reference and that seemed ok, but this was not thoroughly tested and
+// is not safely implemented, it's more a proof of concept atm.
 
 int main(int argc, char *argv[]){
 
