@@ -45,6 +45,7 @@ class RMSNorm(torch.nn.Module):
         Forward pass for RMSNorm.
         """
         # Normalize the input tensor and apply the scaling parameter
+        
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
