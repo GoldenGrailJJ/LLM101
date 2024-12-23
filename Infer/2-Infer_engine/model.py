@@ -471,15 +471,28 @@ def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
             # 对 logits 进行温度缩放
             logits = logits / temperature
 
-            # ? 如果设置了 top_k，仅保留概率最高的前 k 个词
+            # 如果设置了 top_k，仅保留概率最高的前 k 个词
             if top_k is not None:
+                # values, indices = torch.topk(input, k, dim=-1, largest=True, sorted=True)
+                # input: 输入张量, k: 保留的最大元素数, dim: 沿着哪个维度计算
+                # values: 保留的最大元素值, indices: 保留的最大元素索引
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                # v[:, [-1]] 表示每行的第k大的值
                 logits[logits < v[:, [-1]]] = -float('Inf')  # 将其他词的概率置为负无穷
 
             # 将 logits 转换为概率分布
             probs = F.softmax(logits, dim=-1)
 
             # 根据概率分布采样下一个词
+            # torch.multinomial 函数用于从给定的概率分布中随机采样
+            # 参数解释：
+            #   probs: 形状为 (batch_size, vocab_size) 的二维张量，每行是一个概率分布
+            #          每个概率分布是通过 softmax 得到的，表示当前词汇表中每个词的概率
+            #   num_samples=1: 表示对每一行的概率分布采样 1 次，生成一个词的索引
+            # 返回值：
+            #   idx_next: 形状为 (batch_size, num_samples) 的二维张量，包含采样结果的索引
+            #   - 每行的索引表示在对应的概率分布中采样得到的词的索引
+            #   - 因为 num_samples=1，返回的每行只有一个采样索引
             idx_next = torch.multinomial(probs, num_samples=1)
 
         # 4. 将采样得到的新词追加到序列中
