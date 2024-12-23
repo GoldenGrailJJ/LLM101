@@ -399,7 +399,6 @@ class Transformer(nn.Module):
         elif isinstance(module, nn.Embedding):  # 判断是否是嵌入层
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)  # 初始化权重
 
-
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         实现前向传播：
@@ -437,70 +436,118 @@ class Transformer(nn.Module):
 
         return logits
     
-
-@torch.inference_mode()
-def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-    """
-    实现文本生成逻辑：
-    - idx: 初始输入序列 (LongTensor，形状为 (batch_size, seq_len))。
-    - max_new_tokens: 生成的新词数量。
-    - temperature: 采样温度，控制生成的多样性。
-    - top_k: 限制采样时只考虑概率最高的前 k 个词（如果设置为 None，则不限制）。
-    """
-    for _ in range(max_new_tokens):  # 逐步生成 max_new_tokens 个新词
-        # 1. 如果序列过长，裁剪到最大上下文长度
-        idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
+    def estimate_mfu(self, fwdbwd_per_iter, dt):
         """
-        如果长度小于或等于模型允许的最大序列长度（self.params.max_seq_len），直接使用整个序列。
-        如果长度超过最大长度，则截断，只保留最后 max_seq_len 个词。
+        估算模型的 FLOPS 利用率（MFU, Model FLOPS Utilization），单位为 A100 GPU bfloat16 的峰值 FLOPS。
+        
+        参数：
+        - fwdbwd_per_iter: 每次迭代中前向和反向传播的次数，通常为 1 或 2。
+        - dt: 每次迭代的耗时（以秒为单位）。
+        
+        返回值：
+        - mfu: 模型 FLOPS 利用率，表示实际 FLOPS 与 A100 bfloat16 峰值 FLOPS 的比值。
         """
+        # 第一步：估算每次迭代中执行的 FLOPS（浮点运算次数）。
+        # 参考 PaLM 论文的 Appendix B：https://arxiv.org/abs/2204.02311
 
-        # 2. 前向传播，获取当前序列的 logits
-        logits = self(idx_cond)  # 模型前向计算
-        logits = logits[:, -1, :]  # 只取最后一个时间步的 logits
+        # 1. 计算模型中的总参数数量 N
+        N = sum(p.numel() for p in self.parameters())  # 所有参数的总数量（标量计数）
+
+        # 2. 提取模型的配置参数
+        cfg = self.params
+        L = cfg.n_layers       # 模型的层数
+        H = cfg.n_heads        # 注意力头的数量
+        Q = cfg.dim // cfg.n_heads  # 每个注意力头的维度
+        T = cfg.max_seq_len    # 最大序列长度
+
+        # 3. 计算每个 token 的 FLOPS
+        # 每个 token 的 FLOPS 包括：
+        # - 6N：完全连接层的权重乘加运算，N 是参数总数
+        # - 12*L*H*Q*T：注意力机制的计算量，涉及 Q、K、V 的点积和缩放操作
+        flops_per_token = 6 * N + 12 * L * H * Q * T
+
+        # 4. 计算每次前向和反向传播的 FLOPS
+        # 每个前向+反向传播需要处理整个序列长度 T，因此：
+        flops_per_fwdbwd = flops_per_token * T
+
+        # 5. 计算每次迭代的 FLOPS
+        # 每次迭代可能包括多个前向和反向传播（由 fwdbwd_per_iter 决定）。
+        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
+
+        # 第二步：将实际 FLOPS 转化为每秒的 FLOPS
+        flops_achieved = flops_per_iter * (1.0 / dt)  # 每秒实际执行的 FLOPS
+
+        # 第三步：计算 A100 GPU 的峰值 bfloat16 FLOPS
+        flops_promised = 312e12  # A100 GPU bfloat16 的峰值性能为 312 TFLOPS（312 * 10^12 FLOPS）
+
+        # 第四步：计算模型 FLOPS 利用率
+        mfu = flops_achieved / flops_promised  # 实际 FLOPS 与峰值 FLOPS 的比值
+
+        return mfu
+
+    @torch.inference_mode()
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
-        logits.shape: (batch_size, seq_len, vocab_size)。
-        经过 [:, -1, :] 裁剪后，形状变为 (batch_size, vocab_size)，对应当前时间步的预测分布。
+        实现文本生成逻辑：
+        - idx: 初始输入序列 (LongTensor，形状为 (batch_size, seq_len))。
+        - max_new_tokens: 生成的新词数量。
+        - temperature: 采样温度，控制生成的多样性。
+        - top_k: 限制采样时只考虑概率最高的前 k 个词（如果设置为 None，则不限制）。
         """
+        for _ in range(max_new_tokens):  # 逐步生成 max_new_tokens 个新词
+            # 1. 如果序列过长，裁剪到最大上下文长度
+            idx_cond = idx if idx.size(1) <= self.params.max_seq_len else idx[:, -self.params.max_seq_len:]
+            """
+            如果长度小于或等于模型允许的最大序列长度（self.params.max_seq_len），直接使用整个序列。
+            如果长度超过最大长度，则截断，只保留最后 max_seq_len 个词。
+            """
 
-        # 3. 根据温度采样或直接选择最高概率的词
-        if temperature == 0.0:
-            # 如果温度为 0，选择概率最高的词（贪心搜索）
-            _, idx_next = torch.topk(logits, k=1, dim=-1)
-        else:
-            # 对 logits 进行温度缩放
-            logits = logits / temperature
+            # 2. 前向传播，获取当前序列的 logits
+            logits = self(idx_cond)  # 模型前向计算
+            logits = logits[:, -1, :]  # 只取最后一个时间步的 logits
+            """
+            logits.shape: (batch_size, seq_len, vocab_size)。
+            经过 [:, -1, :] 裁剪后，形状变为 (batch_size, vocab_size)，对应当前时间步的预测分布。
+            """
 
-            # 如果设置了 top_k，仅保留概率最高的前 k 个词
-            if top_k is not None:
-                # values, indices = torch.topk(input, k, dim=-1, largest=True, sorted=True)
-                # input: 输入张量, k: 保留的最大元素数, dim: 沿着哪个维度计算
-                # values: 保留的最大元素值, indices: 保留的最大元素索引
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                # v[:, [-1]] 表示每行的第k大的值
-                logits[logits < v[:, [-1]]] = -float('Inf')  # 将其他词的概率置为负无穷
+            # 3. 根据温度采样或直接选择最高概率的词
+            if temperature == 0.0:
+                # 如果温度为 0，选择概率最高的词（贪心搜索）
+                _, idx_next = torch.topk(logits, k=1, dim=-1)
+            else:
+                # 对 logits 进行温度缩放
+                logits = logits / temperature
 
-            # 将 logits 转换为概率分布
-            probs = F.softmax(logits, dim=-1)
+                # 如果设置了 top_k，仅保留概率最高的前 k 个词
+                if top_k is not None:
+                    # values, indices = torch.topk(input, k, dim=-1, largest=True, sorted=True)
+                    # input: 输入张量, k: 保留的最大元素数, dim: 沿着哪个维度计算
+                    # values: 保留的最大元素值, indices: 保留的最大元素索引
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    # v[:, [-1]] 表示每行的第k大的值
+                    logits[logits < v[:, [-1]]] = -float('Inf')  # 将其他词的概率置为负无穷
 
-            # 根据概率分布采样下一个词
-            # torch.multinomial 函数用于从给定的概率分布中随机采样
-            # 参数解释：
-            #   probs: 形状为 (batch_size, vocab_size) 的二维张量，每行是一个概率分布
-            #          每个概率分布是通过 softmax 得到的，表示当前词汇表中每个词的概率
-            #   num_samples=1: 表示对每一行的概率分布采样 1 次，生成一个词的索引
-            # 返回值：
-            #   idx_next: 形状为 (batch_size, num_samples) 的二维张量，包含采样结果的索引
-            #   - 每行的索引表示在对应的概率分布中采样得到的词的索引
-            #   - 因为 num_samples=1，返回的每行只有一个采样索引
-            idx_next = torch.multinomial(probs, num_samples=1)
+                # 将 logits 转换为概率分布
+                probs = F.softmax(logits, dim=-1)
 
-        # 4. 将采样得到的新词追加到序列中
-        idx = torch.cat((idx, idx_next), dim=1)
-        """
-        torch.cat: 将新词 idx_next 添加到原序列 idx 的末尾。
-        idx.shape: 逐步增长，最终形状为 (batch_size, seq_len + max_new_tokens)。
-        """
+                # 根据概率分布采样下一个词
+                # torch.multinomial 函数用于从给定的概率分布中随机采样
+                # 参数解释：
+                #   probs: 形状为 (batch_size, vocab_size) 的二维张量，每行是一个概率分布
+                #          每个概率分布是通过 softmax 得到的，表示当前词汇表中每个词的概率
+                #   num_samples=1: 表示对每一行的概率分布采样 1 次，生成一个词的索引
+                # 返回值：
+                #   idx_next: 形状为 (batch_size, num_samples) 的二维张量，包含采样结果的索引
+                #   - 每行的索引表示在对应的概率分布中采样得到的词的索引
+                #   - 因为 num_samples=1，返回的每行只有一个采样索引
+                idx_next = torch.multinomial(probs, num_samples=1)
 
-    # 5. 返回完整生成的序列
-    return idx
+            # 4. 将采样得到的新词追加到序列中
+            idx = torch.cat((idx, idx_next), dim=1)
+            """
+            torch.cat: 将新词 idx_next 添加到原序列 idx 的末尾。
+            idx.shape: 逐步增长，最终形状为 (batch_size, seq_len + max_new_tokens)。
+            """
+
+        # 5. 返回完整生成的序列
+        return idx
