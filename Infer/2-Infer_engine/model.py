@@ -436,6 +436,62 @@ class Transformer(nn.Module):
 
         return logits
     
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        """
+        配置优化器函数，使用分组参数以优化模型的训练性能。
+
+        参数：
+        - weight_decay: 权重衰减系数，用于正则化（L2 范数）。
+        - learning_rate: 学习率，控制参数更新的步长。
+        - betas: AdamW 优化器的超参数 (beta1, beta2)，用于一阶和二阶动量的计算。
+        - device_type: 设备类型，通常为 'cuda' 或 'cpu'，决定是否启用 fused 优化器。
+
+        返回值：
+        - optimizer: 配置好的 AdamW 优化器实例。
+        """
+        # 第一步：获取所有模型参数
+        # `self.named_parameters()` 返回模型中所有参数及其名称
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+
+        # 第二步：过滤掉不需要梯度计算的参数
+        # 只有 `requires_grad=True` 的参数会参与优化，通常冻结层的参数会被过滤掉
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # 第三步：根据参数维度将其分为两组
+        # 1. 需要应用权重衰减的参数（`dim >= 2` 的张量，例如权重矩阵和嵌入矩阵）
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+
+        # 2. 不需要权重衰减的参数（`dim < 2` 的张量，例如偏置项和 LayerNorm 参数）
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        # 第四步：定义优化器的参数组
+        # 权重衰减组和无权重衰减组分别配置
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},  # 应用权重衰减
+            {'params': nodecay_params, 'weight_decay': 0.0}          # 无权重衰减
+        ]
+
+        # 打印参数信息
+        num_decay_params = sum(p.numel() for p in decay_params)  # 统计需要权重衰减的参数数量
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)  # 统计不需要权重衰减的参数数量
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+
+        # 第五步：选择是否启用 fused 优化器
+        # 检查 torch.optim.AdamW 是否支持 fused 参数
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        # 如果 fused 可用且设备是 CUDA，则启用 fused 版本的 AdamW 优化器
+        use_fused = fused_available and device_type == 'cuda'
+        # 如果使用 fused 优化器，则添加对应参数
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+
+        # 打印是否使用 fused 优化器
+        print(f"using fused AdamW: {use_fused}")
+
+        # 返回配置好的优化器
+        return optimizer
+    
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """
         估算模型的 FLOPS 利用率（MFU, Model FLOPS Utilization），单位为 A100 GPU bfloat16 的峰值 FLOPS。
