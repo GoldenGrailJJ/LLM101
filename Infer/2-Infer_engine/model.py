@@ -24,7 +24,6 @@ class ModelArgs:
     max_seq_len: int = 2048  # Maximum sequence length for inputs
     dropout: float = 0.0  # Dropout rate for regularization
 
-
 # Define a custom RMSNorm layer, a type of normalization layer
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
@@ -198,7 +197,7 @@ class Attention(nn.Module):
         # 每个头的维度
         self.head_dim = args.dim // self.n_heads
         
-        # 定义线性层，用于生成 Q, K, V
+        # ? 定义线性层，用于生成 Q, K, V
         self.wq = nn.Linear(args.dim, self.n_local_heads * self.head_dim, bias=False)
         self.wk = nn.Linear(args.dim, self.n_local_kv_heads * self.head_dim, bias=False)
         self.wv = nn.Linear(args.dim, self.n_local_kv_heads * self.head_dim, bias=False)
@@ -299,8 +298,10 @@ class TransformerBlock(nn.Module):
         self.n_heads = args.n_heads
         self.dim = args.dim
         self.head_dim = args.dim // args.n_heads  # 每个头的维度
+
         # 初始化注意力机制
         self.attention = Attention(args)
+
         # 初始化前馈网络
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -308,6 +309,7 @@ class TransformerBlock(nn.Module):
             multiple_of=args.multiple_of,
             dropout=args.dropout,
         )
+
         # 层归一化
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
