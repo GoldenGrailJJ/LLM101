@@ -359,6 +359,49 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
+void rmsnorm(float* o, float* x, float* weight, int size) {
+    float ss = 0.0f;
+    for (int i = 0; i < size; ++i) {
+        ss += x[i] * x[i];
+    }
+    ss /= size;
+    ss += 1e-5f;
+    ss = 1.0f / sqrtf(ss);
+    for (int i = 0; i < size; i++) {
+        o[i] = weight[i] * (ss * x[i]);
+    }
+}
+
+void softmax(float* x, int size) {
+    float max_val = x[0];
+    for (int i = 1; i < size; ++i) {
+        if (x[i] > max_val) {
+            max_val = x[i];
+        }
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < size; ++i) {
+        x[i] = expf(x[i] - max_val);
+        sum += x[i];
+    }
+
+    for (int i = 0; i < size; ++i) {
+        x[i] /= sum;
+    }
+}
+
+void matmul(float* xout, float* x, float* w, int n, int d) {
+    int i;
+    #pragma omp parallel for private(i)
+    for (int i = 0; i < d; ++i) {
+        float val = 0.0f;
+        for (int j = 0; j < n; ++j) {
+            val += w[i * n + j] * x[j];
+        }
+        xout[i] = val;
+    }
+}
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
