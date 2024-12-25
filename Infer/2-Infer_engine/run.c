@@ -403,6 +403,92 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+float* forward(Transformer* transformer, int token, int pos){
+    Config* p = &transformer->config;
+    TransformerWeights* w = &transformer->weights;
+    RunState* s = &transformer->state;
+    // 浮点数组，表示当前层的特征向量
+    float *x = s->x;
+    // 特征向量维度
+    int dim = p->dim;
+    // feedforward network的隐藏层维度
+    int hidden_dim = p->hidden_dim;
+    // n_kv_heads表示key和value的头数，n_heads表示query的头数
+    int kv_dim = (p->dim * p->n_kv_heads) / n->heads;
+    // 每个key/value头需要支持的查询头的数量
+    // 比如 n_heads=12，n_kv_heads=4，那么每个key/value头需要支持3个查询头  
+    int kv_mul = n_heads / n_kv_heads;
+    int head_size = dim / p->n_heads;
+
+    // copy the token embedding into x
+    // 数组：id to dense vector，根据id快速得到对应的dense vector
+    // 数组：dense vector 变换为 feature vector
+    float* content_row = w->token_embedding_table + token * dim;
+    memcpy(x, content_row, dim * sizeof(*x));
+
+    for(unsigned long long l = 0; l < p->n_layers; ++l){
+        rmsnorm(s->xb, x, w->rms_attn_weight + l * dim, dim);
+
+        int loff = p->seq_len * l * kv_dim;
+        s->k = s->key_cache + loff + pos * kv_dim;
+
+        matmul(s->q, s->xb, w->wq + l * dim * dim, dim, dim);
+        matmul(s->k, s->xb, w->wk + l * dim * kv_dim, dim, kv_dim);
+        matmul(s->v, s->xb, w->wv + l * dim * kv_dim, dim, kv_dim);
+
+        for (int i = 0; i < dim; i += 2) {
+            int head_dim = i % head_size;
+            float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
+            float val = pos * freq;
+            float fcr = cosf(val);
+            float fci = sinf(val);
+            int rotn = i < kv_dim ? 2 : 1;
+            for (int v = 0; v < rotn; ++v) {
+                float* vec = v == 0 ? s->q : s->k;
+                float v0 = vec[i];
+                float v1 = vec[i + 1];
+                vec[i] = v0 * fcr - v1 * fci;
+                vec[i + 1] = v0 * fci + v1 * fcr;
+            }
+        }
+
+        int h;
+        for (h = 0; h < p->n_heads; ++h) {
+            // 找到第h个head的q，k，v
+            float* q = s->q + h * head_size;
+            float* att = s->att + h * p->seq_len;
+            // 计算attention score
+            for (int t = 0; t <= pos; ++t) {
+                // 计算第t个位置的key，需要考虑层和头的影响
+                // kv_mul表示key和value头的数量，kv_dim表示每个key和value头的维度
+                // h / kv_mul表示当前head对应的key和value头的索引
+                // 还是以 3 为例，h = 0, 1, 2 时对应的key和value头索引为 0
+                float* k = s->key_cache + loff + t * kv_dim + h * kv_dim / kv_mul;
+                float score = 0.0f;
+                // q 和 k 的维度都是 head_size
+                for (int i = 0; i < head_size; ++i) {
+                    score += q[i] * k[i];
+                }
+                score /= sqrtf(head_size);
+                attn[t] = score;
+            }
+        }
+
+        softmax(att, pos + 1);
+
+        float* xb = s->xb + h * head_size;
+        memset(xb, 0, head_size * sizeof(float));
+
+        for (int t = 0; t <= pos; ++t) {
+            float* v = s->value_cache + loff + t * kv_dim + h * head_size / kv_mul
+            float score = att[t];
+            for (int i = 0; i < head_size; ++i) {
+                xb[i] += v[i] * score
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
