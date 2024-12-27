@@ -855,6 +855,19 @@ int sample_argmax(float* probabilities, int n) {
     return max_i;
 }
 
+int sample_mult(float* probabilities, int n, float coin) {
+    // sample index from probabilities (they must sum to 1!)
+    // coin is a random number in [0, 1), usually from random_f32()
+    float cdf = 0.0f;
+    for (int i = 0; i < n; i++) {
+        cdf += probabilities[i];
+        if (coin < cdf) {
+            return i;
+        }
+    }
+    return n - 1; // in case of rounding errors
+}
+
 /**
  * @brief 比较两个 ProbIndex 对象的概率值，用于排序。
  *
@@ -877,6 +890,48 @@ int compare(const void* a, const void* b) {
     if (a_->prob > b_->prob) return -1; // a_ 的 prob 更大，a_ 排在 b_ 前面
     if (a_->prob < b_->prob) return 1;  // b_ 的 prob 更大，b_ 排在 a_ 前面
     return 0;                           // prob 相等，位置保持不变
+}
+
+int sample_topp(float* probabilities, int n, float topp, ProbIndex* probindex, float coin) {
+    // Top-p采样（或称“核采样”）从累积概率超过阈值 topp 的最小 token 集中进行采样。
+    // 这种方法可以避免采样到概率非常低的 token，从而减少生成内容“跑偏”的风险。
+    // 参数 coin 是一个随机数，范围为 [0, 1)，通常由 random_f32() 生成。
+
+    int n0 = 0;
+    // 按概率降序快速排序索引
+    // 小于 (1 - topp) / (n - 1) 的值不能成为候选项
+    // 为了提高效率，在排序之前将这些候选项剔除
+    const float cutoff = (1.0f - topp) / (n - 1);
+    for (int i = 0; i < n; i++) {
+        if (probabilities[i] >= cutoff) {
+            probindex[n0].index = i;       // 保存符合条件的 token 索引
+            probindex[n0].prob = probabilities[i]; // 保存对应概率
+            n0++;
+        }
+    }
+    qsort(probindex, n0, sizeof(ProbIndex), compare); // 对候选项按概率降序排序
+
+    // 截断列表，保留累积概率不超过 topp 的 token 集
+    float cumulative_prob = 0.0f;
+    int last_idx = n0 - 1; // 如果由于舍入误差无法满足条件，则默认考虑所有元素
+    for (int i = 0; i < n0; i++) {
+        cumulative_prob += probindex[i].prob;
+        if (cumulative_prob > topp) {
+            last_idx = i; // 找到满足累积概率超过 topp 的位置
+            break;        // 截断循环
+        }
+    }
+
+    // 从截断后的 token 集中采样
+    float r = coin * cumulative_prob; // 随机数映射到 [0, cumulative_prob) 范围
+    float cdf = 0.0f;                 // 初始化累积分布函数
+    for (int i = 0; i <= last_idx; i++) {
+        cdf += probindex[i].prob;
+        if (r < cdf) {                // 判断随机数是否落入当前区间
+            return probindex[i].index; // 返回对应的 token 索引
+        }
+    }
+    return probindex[last_idx].index; // 如果出现舍入误差，返回最后一个 token
 }
 
 void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
@@ -1032,6 +1087,88 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // I manually inspected the tokens for a few chat conversations compared to
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
+void chat(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler,
+          char *cli_user_prompt, char *cli_system_prompt, int steps) {
+
+    // buffers for reading the system prompt and user prompt from stdin
+    // you'll notice they are soomewhat haphazardly and unsafely set atm
+    char system_prompt[512];
+    char user_prompt[512];
+    char rendered_prompt[1152];
+    int num_prompt_tokens = 0;
+    int* prompt_tokens = (int*)malloc(1152 * sizeof(int));
+    int user_idx;
+
+    // start the main loop
+    int8_t user_turn = 1; // user starts
+    int next;        // will store the next token in the sequence
+    int token;       // stores the current token to feed into the transformer
+    int prev_token;
+    int pos = 0;     // position in the sequence
+    while (pos < steps) {
+        // when it is the user's turn to contribute tokens to the dialog...
+        if (user_turn) {
+            // get the (optional) system prompt at position 0
+            if (pos == 0) {
+                // at position 0, the user can also contribute a system prompt
+                if (cli_system_prompt == NULL) {
+                    // system prompt was not passed in, attempt to get it from stdin
+                    read_stdin("Enter system prompt (optional): ", system_prompt, sizeof(system_prompt));
+                } else {
+                    // system prompt was passed in, use it
+                    strcpy(system_prompt, cli_system_prompt);
+                }
+            }
+            // get the user prompt
+            if (pos == 0 && cli_user_prompt != NULL) {
+                // user prompt for position 0 was passed in, use it
+                strcpy(user_prompt, cli_user_prompt);
+            } else {
+                // otherwise get user prompt from stdin
+                read_stdin("User: ", user_prompt, sizeof(user_prompt));
+            }
+            // render user/system prompts into the Llama 2 Chat schema
+            if (pos == 0 && system_prompt[0] != '\0') {
+                char system_template[] = "[INST] <<SYS>>\n%s\n<</SYS>>\n\n%s [/INST]";
+                sprintf(rendered_prompt, system_template, system_prompt, user_prompt);
+            } else {
+                char user_template[] = "[INST] %s [/INST]";
+                sprintf(rendered_prompt, user_template, user_prompt);
+            }
+            // encode the rendered prompt into tokens
+            encode(tokenizer, rendered_prompt, 1, 0, prompt_tokens, &num_prompt_tokens);
+            user_idx = 0; // reset the user index
+            user_turn = 0;
+            printf("Assistant: ");
+        }
+
+        // determine the token to pass into the transformer next
+        if (user_idx < num_prompt_tokens) {
+            // if we are still processing the input prompt, force the next prompt token
+            token = prompt_tokens[user_idx++];
+        } else {
+            // otherwise use the next token sampled from previous turn
+            token = next;
+        }
+        // EOS (=2) token ends the Assistant turn
+        if (token == 2) { user_turn = 1; }
+
+        // forward the transformer to get logits for the next token
+        float* logits = forward(transformer, token, pos);
+        next = sample(sampler, logits);
+        pos++;
+
+        if (user_idx >= num_prompt_tokens && next != 2) {
+            // the Assistant is responding, so print its output
+            char* piece = decode(tokenizer, token, next);
+            safe_printf(piece); // same as printf("%s", piece), but skips "unsafe" bytes
+            fflush(stdout);
+        }
+        if (next == 2) { printf("\n"); }
+    }
+    printf("\n");
+    free(prompt_tokens);
+}
 
 // ----------------------------------------------------------------------------
 // CLI, include only if not testing
@@ -1142,3 +1279,4 @@ int main(int argc, char *argv[]){
     free_transformer(&transformer); // Free resources allocated for the transformer
     return 0; // Return success
 }
+#endif
