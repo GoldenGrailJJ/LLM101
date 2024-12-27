@@ -617,6 +617,16 @@ void free_tokenizer(Tokenizer* t) {
     free(t->sorted_vocab);
 }
 
+char* decode(Tokenizer* t, int prev_token, int token) {
+    char *piece = t->vocab[token];
+    if (prev_token == 1 && piece[0] == ' ') { piece++; }
+    unsigned char byte_val;
+    if (sscanf(piece, "<0x%02hhX>", &byte_val) == 1) {
+        return (char*)t->byte_pieces + byte_val * 2;
+    }
+    return piece;
+}
+
 /*
  * Function: safe_printf
  * ---------------------
@@ -820,9 +830,89 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
 // The Sampler, which takes logits and returns a sampled token
 // sampling can be done in a few ways: greedy argmax, sampling, top-p sampling
 
+typedef struct {
+    float prob;
+    int index;
+} ProbIndex; // struct used when sorting probabilities during top-p sampling
+
+typedef struct {
+    int vocab_size;
+    ProbIndex* probindex; // buffer used in top-p sampling
+    float temperature;
+    float topp;
+    unsigned long long rng_state;
+} Sampler;
+
+int sample_argmax(float* probabilities, int n) {
+    int max_i = 0;
+    float max_p = probabilities[0];
+    for (int i = 1; i < n; ++i) {
+        if (probabilities[i] > max_p) {
+            max_p = probabilities[i];
+            max_i = i;
+        }
+    }
+    return max_i;
+}
+
+/**
+ * @brief 比较两个 ProbIndex 对象的概率值，用于排序。
+ *
+ * 此函数适用于 `qsort` 等标准库排序函数，
+ * 按照 `ProbIndex` 结构体中 `prob` 字段的大小进行降序排列。
+ * 
+ * @param a 指向第一个待比较的 ProbIndex 对象的指针。
+ * @param b 指向第二个待比较的 ProbIndex 对象的指针。
+ * @return 比较结果：
+ *         - 返回 -1：如果 a 的 prob 大于 b 的 prob，表示 a 排在 b 前面（降序）。
+ *         - 返回 1：如果 a 的 prob 小于 b 的 prob，表示 b 排在 a 前面。
+ *         - 返回 0：如果 a 和 b 的 prob 相等。
+ */
+int compare(const void* a, const void* b) {
+    // 将 void* 类型的指针强制转换为 ProbIndex* 类型
+    ProbIndex* a_ = (ProbIndex*) a;
+    ProbIndex* b_ = (ProbIndex*) b;
+
+    // 比较 prob 字段的值，按照降序排列
+    if (a_->prob > b_->prob) return -1; // a_ 的 prob 更大，a_ 排在 b_ 前面
+    if (a_->prob < b_->prob) return 1;  // b_ 的 prob 更大，b_ 排在 a_ 前面
+    return 0;                           // prob 相等，位置保持不变
+}
+
+void build_sampler(Sampler* sampler, int vocab_size, float temperature, float topp, unsigned long long rng_seed) {
+    sampler->vocab_size = vocab_size;           // 设置词汇表大小
+    sampler->temperature = temperature;        // 设置采样温度，用于控制生成的多样性
+    sampler->topp = topp;                       // 设置 Top-p 采样阈值，用于控制概率累计范围
+    sampler->rng_state = rng_seed;             // 初始化随机数生成器的种子状态
+    // buffer only used with nucleus sampling; may not need but it's ~small
+    sampler->probindex = malloc(sampler->vocab_size * sizeof(ProbIndex));  // 分配存储概率的缓冲区
+}
+
+void free_sampler(Sampler* sampler) {
+    free(sampler->probindex);  // 释放分配给 probindex 的内存
+}
+
+unsigned int random_u32(unsigned long long *state) {
+    // xorshift 随机数生成器算法
+    *state ^= *state >> 12;  // 位操作：右移 12 位并与当前状态异或
+    *state ^= *state << 25;  // 位操作：左移 25 位并与当前状态异或
+    *state ^= *state >> 27;  // 位操作：右移 27 位并与当前状态异或
+    return (*state * 0x2545F4914F6CDD1Dull) >> 32;  // 混淆并提取高 32 位
+}
+
+float random_f32(unsigned long long *state) { // random float32 in [0,1)
+    return (random_u32(state) >> 8) / 16777216.0f;  // 生成随机浮点数
+}
+
 // ----------------------------------------------------------------------------
 // utilities: time
 
+long time_in_ms() {
+    // return time in milliseconds, for benchmarking the model speed
+    struct timespec time;
+    clock_gettime(CLOCK_REALTIME, &time);
+    return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+}
 
 // ----------------------------------------------------------------------------
 // generation loop
@@ -942,6 +1032,25 @@ void read_stdin(const char* guide, char* buffer, size_t bufsize) {
 // I manually inspected the tokens for a few chat conversations compared to
 // python reference and that seemed ok, but this was not thoroughly tested and
 // is not safely implemented, it's more a proof of concept atm.
+
+// ----------------------------------------------------------------------------
+// CLI, include only if not testing
+#ifndef TESTING
+
+void error_usage() {
+    fprintf(stderr, "Usage:   run <checkpoint> [options]\n");
+    fprintf(stderr, "Example: run model.bin -n 256 -i \"Once upon a time\"\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -t <float>  temperature in [0,inf], default 1.0\n");
+    fprintf(stderr, "  -p <float>  p value in top-p (nucleus) sampling in [0,1] default 0.9\n");
+    fprintf(stderr, "  -s <int>    random seed, default time(NULL)\n");
+    fprintf(stderr, "  -n <int>    number of steps to run for, default 256. 0 = max_seq_len\n");
+    fprintf(stderr, "  -i <string> input prompt\n");
+    fprintf(stderr, "  -z <string> optional path to custom tokenizer\n");
+    fprintf(stderr, "  -m <string> mode: generate|chat, default: generate\n");
+    fprintf(stderr, "  -y <string> (optional) system prompt in chat mode\n");
+    exit(EXIT_FAILURE);
+}
 
 int main(int argc, char *argv[]){
 
